@@ -1,0 +1,9 @@
+# the Emacs checkout is huge and reproducible via `make setup`
+emacs/
+
+# local planning notes, not part of the submission
+PLAN.md
+
+*.elc
+*~
+.DS_Store
