@@ -24,9 +24,14 @@ fi
 
 if [ ! -f Makefile ]; then
   echo ">> configuring (no native-comp: everything must go through exec_byte_code)"
+  # no tree-sitter: 30.1 predates the 0.25+ API rename and won't compile against it
+  # ac_cv_func_pipe2=no: the SDK declares pipe2 as a weak import that resolves to
+  # NULL at runtime here, so calling it segfaults; force gnulib's pipe() fallback
+  ac_cv_func_pipe2=no \
   ./configure \
     --without-native-compilation \
     --without-ns --without-x \
+    --without-tree-sitter \
     --with-gnutls=ifavailable
 fi
 
