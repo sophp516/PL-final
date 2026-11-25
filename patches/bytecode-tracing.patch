@@ -1,0 +1,197 @@
+diff --git a/src/alloc.c b/src/alloc.c
+index ce2a9fe..5fb744e 100644
+--- a/src/alloc.c
++++ b/src/alloc.c
+@@ -2892,6 +2892,8 @@ DEFUN ("cons", Fcons, Scons, 2, 2, 0,
+   eassert (!XCONS_MARKED_P (XCONS (val)));
+   consing_until_gc -= sizeof (struct Lisp_Cons);
+   cons_cells_consed++;
++  if (bytecode_tracing_enabled)
++    bct_count_cons ();
+   return val;
+ }
+ 
+diff --git a/src/bytecode.c b/src/bytecode.c
+index 770af6b..8b04a0b 100644
+--- a/src/bytecode.c
++++ b/src/bytecode.c
+@@ -459,6 +459,64 @@ valid_sp (struct bc_thread_state *bc, Lisp_Object *sp)
+   return sp < (Lisp_Object *)fp && sp + 1 >= fp->saved_fp->next_stack;
+ }
+ 
++/* Per-function tracing of executed bytecodes and allocated conses.
++
++   The VM's own frame stack already knows the running function
++   (bc->fp->fun), so attribution is just a lookup keyed by the closure
++   object.  Counts live in an eq hash table mapping function ->
++   (ops . conses), both fixnums.  */
++
++bool bytecode_tracing_enabled;
++
++static Lisp_Object bct_counts;
++
++/* One-entry cache: the common case is many increments for the same
++   function in a row.  */
++static Lisp_Object bct_cached_fun;
++static Lisp_Object bct_cached_cell;
++static bool bct_busy;
++
++static Lisp_Object
++bct_cell (void)
++{
++  struct bc_frame *fp = current_thread->bc.fp;
++  if (!fp->saved_fp)		/* bottom dummy frame: no bytecode running */
++    return Qnil;
++  Lisp_Object fun = fp->fun;
++  if (BASE_EQ (fun, bct_cached_fun))
++    return bct_cached_cell;
++  /* Creating an entry conses; don't count our own allocation.  */
++  if (bct_busy)
++    return Qnil;
++  bct_busy = true;
++  Lisp_Object cell = Fgethash (fun, bct_counts, Qnil);
++  if (NILP (cell))
++    {
++      cell = Fcons (make_fixnum (0), make_fixnum (0));
++      Fputhash (fun, cell, bct_counts);
++    }
++  bct_cached_fun = fun;
++  bct_cached_cell = cell;
++  bct_busy = false;
++  return cell;
++}
++
++static void
++bct_count_op (void)
++{
++  Lisp_Object cell = bct_cell ();
++  if (!NILP (cell))
++    XSETCAR (cell, make_fixnum (XFIXNUM (XCAR (cell)) + 1));
++}
++
++void
++bct_count_cons (void)
++{
++  Lisp_Object cell = bct_cell ();
++  if (!NILP (cell))
++    XSETCDR (cell, make_fixnum (XFIXNUM (XCDR (cell)) + 1));
++}
++
+ /* Execute the byte-code in FUN.  ARGS_TEMPLATE is the function arity
+    encoded as an integer (the one in FUN is ignored), and ARGS, of
+    size NARGS, should be a vector of the actual arguments.  The
+@@ -544,6 +602,13 @@ exec_byte_code (Lisp_Object fun, ptrdiff_t args_template,
+       if (BYTE_CODE_SAFE && !valid_sp (bc, top))
+ 	emacs_abort ();
+ 
++#ifndef BYTE_CODE_THREADED
++      /* With threading the loop body runs once per frame entry, not
++	 per instruction, so the threaded count lives in NEXT.  */
++      if (bytecode_tracing_enabled)
++	bct_count_op ();
++#endif
++
+ #ifdef BYTE_CODE_METER
+       int prev_op = this_op;
+       this_op = op = FETCH;
+@@ -565,7 +630,11 @@ #define CASE(OP) insn_ ## OP
+       /* NEXT is invoked at the end of an instruction to go to the
+ 	 next instruction.  It is either a computed goto, or a
+ 	 plain break.  */
+-#define NEXT goto *(targets[op = FETCH])
++#define NEXT do {				\
++	if (bytecode_tracing_enabled)		\
++	  bct_count_op ();			\
++	goto *(targets[op = FETCH]);		\
++      } while (false)
+       /* FIRST is like NEXT, but is only used at the start of the
+ 	 interpreter body.  In the switch-based interpreter it is the
+ 	 switch, so the threaded definition must include a semicolon.  */
+@@ -1794,6 +1863,55 @@ get_byte_code_arity (Lisp_Object args_template)
+ 		rest ? Qmany : make_fixnum (nonrest));
+ }
+ 
++DEFUN ("bytecode-trace-start", Fbytecode_trace_start, Sbytecode_trace_start,
++       0, 0, 0,
++       doc: /* Zero all bytecode trace counters and enable tracing.  */)
++  (void)
++{
++  Fclrhash (bct_counts);
++  bct_cached_fun = Qnil;
++  bct_cached_cell = Qnil;
++  bytecode_tracing_enabled = true;
++  return Qnil;
++}
++
++DEFUN ("bytecode-trace-stop", Fbytecode_trace_stop, Sbytecode_trace_stop,
++       0, 0, 0,
++       doc: /* Disable bytecode tracing.  Counters keep their values.  */)
++  (void)
++{
++  bytecode_tracing_enabled = false;
++  return Qnil;
++}
++
++DEFUN ("bytecode-trace-reset", Fbytecode_trace_reset, Sbytecode_trace_reset,
++       0, 0, 0,
++       doc: /* Zero all bytecode trace counters without changing the enabled flag.  */)
++  (void)
++{
++  Fclrhash (bct_counts);
++  bct_cached_fun = Qnil;
++  bct_cached_cell = Qnil;
++  return Qnil;
++}
++
++DEFUN ("bytecode-trace-counts", Fbytecode_trace_counts, Sbytecode_trace_counts,
++       0, 0, 0,
++       doc: /* Return trace counts as an alist of (FUNCTION . (OPS . CONSES)).
++FUNCTION is the byte-code object that was executed.  */)
++  (void)
++{
++  /* Don't trace the consing done here.  */
++  bool was_enabled = bytecode_tracing_enabled;
++  bytecode_tracing_enabled = false;
++  Lisp_Object alist = Qnil;
++  struct Lisp_Hash_Table *h = XHASH_TABLE (bct_counts);
++  DOHASH (h, k, v)
++    alist = Fcons (Fcons (k, Fcons (XCAR (v), XCDR (v))), alist);
++  bytecode_tracing_enabled = was_enabled;
++  return alist;
++}
++
+ void
+ syms_of_bytecode (void)
+ {
+@@ -1802,6 +1920,18 @@ syms_of_bytecode (void)
+   defsubr (&Sbyte_code);
+   defsubr (&Sinternal_stack_stats);
+ 
++  bct_counts = make_hash_table (&hashtest_eq, DEFAULT_HASH_SIZE,
++				Weak_None, false);
++  staticpro (&bct_counts);
++  bct_cached_fun = Qnil;
++  bct_cached_cell = Qnil;
++  staticpro (&bct_cached_fun);
++  staticpro (&bct_cached_cell);
++  defsubr (&Sbytecode_trace_start);
++  defsubr (&Sbytecode_trace_stop);
++  defsubr (&Sbytecode_trace_reset);
++  defsubr (&Sbytecode_trace_counts);
++
+ #ifdef BYTE_CODE_METER
+ 
+   DEFVAR_LISP ("byte-code-meter", Vbyte_code_meter,
+diff --git a/src/lisp.h b/src/lisp.h
+index 7ddde50..bfb780c 100644
+--- a/src/lisp.h
++++ b/src/lisp.h
+@@ -5280,6 +5280,8 @@ #define DAEMON_RUNNING (w32_daemon_event != INVALID_HANDLE_VALUE)
+ 
+ /* Defined in bytecode.c.  */
+ extern void syms_of_bytecode (void);
++extern bool bytecode_tracing_enabled;
++extern void bct_count_cons (void);
+ extern Lisp_Object exec_byte_code (Lisp_Object, ptrdiff_t,
+ 				   ptrdiff_t, Lisp_Object *);
+ extern Lisp_Object get_byte_code_arity (Lisp_Object);
