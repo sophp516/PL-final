@@ -7,3 +7,4 @@ PLAN.md
 *.elc
 *~
 .DS_Store
+writeup/

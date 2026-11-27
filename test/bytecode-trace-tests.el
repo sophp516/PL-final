@@ -1,8 +1,6 @@
-;;; bytecode-trace-tests.el --- ERT tests for the bytecode tracer -*- lexical-binding: t; -*-
+;;; bytecode-trace-tests.el
 
 ;; Run with:  make test
-;; These all skip (rather than fail) on an unpatched Emacs, so the
-;; suite is runnable from day one.
 
 (require 'ert)
 (require 'bytecode-trace)
@@ -99,6 +97,31 @@ attribute to the right function (the VM frame stack unwinds)."
     ;; add3's counts must look exactly as they do when traced alone.
     (should (= (car entry) 4))
     (should (= (cdr entry) 0))))
+
+(ert-deftest bct-report-resolves-names ()
+  "The report buffer shows symbol names, not raw byte-code objects."
+  (skip-unless (fboundp 'bytecode-trace-start))
+  (byte-compile 'bct-test--add3)
+  (let ((counts (with-bytecode-trace (bct-test--add3 4))))
+    (bytecode-trace-report counts)
+    (with-current-buffer "*bytecode-trace*"
+      (goto-char (point-min))
+      (should (search-forward "bct-test--add3" nil t))
+      (should-not (string-match-p "#\\[" (buffer-string))))))
+
+(ert-deftest bct-report-sorts-by-ops ()
+  "Rows are sorted by bytecode count, descending."
+  (skip-unless (fboundp 'bytecode-trace-start))
+  (defun bct-test--big (n) (let ((s 0)) (dotimes (i n) (setq s (+ s i))) s))
+  (byte-compile 'bct-test--big)
+  (byte-compile 'bct-test--add3)
+  (let ((counts (with-bytecode-trace (bct-test--big 50) (bct-test--add3 1))))
+    (bytecode-trace-report counts)
+    (with-current-buffer "*bytecode-trace*"
+      (goto-char (point-min))
+      (should (< (progn (search-forward "bct-test--big") (point))
+                 (progn (goto-char (point-min))
+                        (search-forward "bct-test--add3") (point)))))))
 
 (provide 'bytecode-trace-tests)
 ;;; bytecode-trace-tests.el ends here
